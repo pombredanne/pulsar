@@ -13,7 +13,8 @@ def expand_star(mod_name):
     there.
     """
     expanded = []
-    mod_dir  = os.path.dirname(__import__(mod_name[:-2], {}, {}, ['']).__file__)
+    mod_dir = os.path.dirname(
+        __import__(mod_name[:-2], {}, {}, ['']).__file__)
     for f in glob.glob1(mod_dir, "[!_]*.py"):
         expanded.append('%s.%s' % (mod_name[:-2], f[:-3]))
     return expanded
@@ -22,6 +23,7 @@ def expand_star(mod_name):
 def import_modules(modules):
     '''Safely import a list of *modules*
     '''
+    all = []
     for mname in modules:
         if mname.endswith('.*'):
             to_load = expand_star(mname)
@@ -29,48 +31,57 @@ def import_modules(modules):
             to_load = [mname]
         for module in to_load:
             try:
-                __import__(module)
+                all.append(import_module(module))
             except ImportError as e:
                 pass
-            
+    return all
 
-def module_attribute(dotpath, default = None):
-    '''
-    Load an attribute from a module.
-    If the module or the attriubute is not available,
-    return the default argument
-    '''
+
+def module_attribute(dotpath, default=None, safe=False):
+    '''Load an attribute from a module. If the module or the attribute
+is not available, return the default argument if *safe* is `True`.'''
     if dotpath:
         bits = str(dotpath).split('.')
         try:
             module = import_module('.'.join(bits[:-1]))
-            return getattr(module,bits[-1],default)
+            return getattr(module, bits[-1], default)
         except Exception as e:
+            if not safe:
+                raise
             return default
     else:
+        if not safe:
+            raise ImportError()
         return default
 
 
-def import_app(module):
-    parts = module.rsplit(":", 1)
-    if len(parts) == 1:
-        module, obj = module, "application"
+def py_file(name):
+    if name.endswith('.py'):
+        return name[:-3]
+    elif name.endswith('.pyc'):
+        return name[:-4]
     else:
-        module, obj = parts[0], parts[1]
+        return name
 
-    try:
-        __import__(module)
-    except ImportError:
-        if module.endswith(".py") and os.path.exists(module):
-            raise ImportError("Failed to find application, did "
-                "you mean '%s:%s'?" % (module.rsplit(".",1)[0], obj))
+
+def import_system_file(mod, add_to_path=True):
+    if os.path.isfile(mod):
+        # it is a file in the system path
+        dir, name = os.path.split(mod)
+        names = [py_file(name)]
+        while dir and not dir in sys.path:
+            ndir, name = os.path.split(dir)
+            if dir == ndir:
+                dir = ''
+                break
+            dir = ndir
+            names.insert(0, name)
+        # the file was not in the system path
+        if not dir and add_to_path:
+            dir, name = os.path.split(mod)
+            if dir and dir != mod:
+                sys.path.append(dir)
+            mod_name = py_file(name)
         else:
-            raise
-
-    mod = sys.modules[module]
-    app = eval(obj, mod.__dict__)
-    if app is None:
-        raise ImportError("Failed to find application object: %r" % obj)
-    if not hasattr(app,'__call__'):
-        raise TypeError("Application object must be callable.")
-    return app
+            mod_name = '.'.join(names)
+        return import_module(mod_name)

@@ -11,6 +11,8 @@ import os
 import sys
 import time
 import imp
+import socket
+
 
 knownPlatforms = {
     'nt': 'win',
@@ -25,6 +27,7 @@ _timeFunctions = {
     'win': time.time,
     }
 
+
 class Platform(object):
     """Gives us information about the platform we're running on"""
 
@@ -33,30 +36,38 @@ class Platform(object):
     seconds = staticmethod(_timeFunctions.get(type, time.time))
 
     def __str__(self):
-        return '{0} - {1}'.format(self.type,self.name)
-    
+        return '{0} - {1}'.format(self.type, self.name)
+
     def __repr__(self):
-        return '{0}: {1}'.format(self.__class__.__name__,self)
-    
+        return '{0}: {1}'.format(self.__class__.__name__, self)
+
     def isKnown(self):
-        """Do we know about this platform?"""
-        return self.type != None
+        """Do we know about this platform?
+        """
+        return self.type is not None
 
     def getType(self):
         """Return ``posix``, ``win`` or ``java``"""
         return self.type
 
+    @property
+    def is_posix(self):
+        return self.type == 'posix'
+
+    @property
     def isMacOSX(self):
         """Return if we are runnng on Mac OS X."""
         return sys.platform == "darwin"
 
-    def isWinNT(self):
+    @property
+    def is_winNT(self):
         """Are we running in Windows NT?"""
         if self.getType() == 'win':
             import _winreg
             try:
-                k=_winreg.OpenKeyEx(_winreg.HKEY_LOCAL_MACHINE,
-                                    r'Software\Microsoft\Windows NT\CurrentVersion')
+                k = _winreg.OpenKeyEx(
+                    _winreg.HKEY_LOCAL_MACHINE,
+                    r'Software\Microsoft\Windows NT\CurrentVersion')
                 _winreg.QueryValueEx(k, 'SystemRoot')
                 return True
             except WindowsError:
@@ -64,10 +75,12 @@ class Platform(object):
         # not windows NT
         return False
 
-    def isWindows(self):
+    @property
+    def is_windows(self):
         return self.getType() == 'win'
 
-    def isVista(self):
+    @property
+    def is_vista(self):
         """
         Check if current platform is Windows Vista or Windows Server 2008.
 
@@ -87,3 +100,9 @@ class Platform(object):
         except ImportError:
             return False
 
+    @property
+    def has_multiProcessSocket(self):
+        ''':rtype: a boolean indicating if support for multiprocess
+ sockets is available.
+        '''
+        return hasattr(socket, 'fromfd')

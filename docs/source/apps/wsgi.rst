@@ -1,5 +1,0 @@
-
-WSGI
-=============
-
-.. automodule:: pulsar.wsgi

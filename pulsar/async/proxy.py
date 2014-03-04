@@ -1,255 +1,239 @@
-from time import time
-from pulsar.utils.py2py3 import iteritems
-from pulsar.utils.tools import gen_unique_id
+from pulsar import CommandNotFound
+from pulsar.utils.pep import default_timer
 
-from .defer import Deferred, is_async
+from .defer import Deferred
+from .consts import *
 
-__all__ = ['ActorRequest',
+__all__ = ['ActorProxyDeferred',
            'ActorProxy',
+           'ActorProxyMonitor',
            'get_proxy',
-           'ActorCallBack',
-           'ActorCallBacks',
-           'DEFAULT_MESSAGE_CHANNEL']
+           'command',
+           'get_command']
+
+global_commands_table = {}
 
 
-DEFAULT_MESSAGE_CHANNEL = '__message__'
-
-
-def get_proxy(obj, safe = False):
-    if isinstance(obj,ActorProxy):
+def get_proxy(obj, safe=False):
+    if isinstance(obj, ActorProxy):
         return obj
-    elif hasattr(obj,'proxy'):
+    elif hasattr(obj, 'proxy'):
         return get_proxy(obj.proxy)
     else:
         if safe:
             return None
         else:
-            raise ValueError('"{0}" is not a remote or remote proxy.'.format(obj))
-        
+            raise ValueError('"%s" is not an actor or actor proxy.' % obj)
 
 
-class ActorCallBack(Deferred):
-    '''An actor callback run on the actor event loop'''
-    def __init__(self, actor, request, *args, **kwargs):
-        super(ActorCallBack,self).__init__()
-        self.args = args
-        self.kwargs = kwargs
-        self.actor = actor
-        self.request = request
-        if is_async(request):
-            self()
-        else:
-            self.callback(self.request)
-        
-    def __call__(self):
-        if self.request.called:
-            self.callback(self.request.result)
-        else:
-            self.actor.ioloop.add_callback(self)
+def actorid(actor):
+    return actor.identity() if hasattr(actor, 'identity') else actor
 
 
-class ActorCallBacks(Deferred):
-    
-    def __init__(self, actor, requests):
-        super(ActorCallBacks,self).__init__()
-        self.actor = actor
-        self.requests = []
-        self._tmp_results = []
-        for r in requests:
-            if is_async(r):
-                self.requests.append(r)
-            else:
-                self._tmp_results.append(r)
-        actor.ioloop.add_callback(self)
-        
-    def __call__(self):
-        if self.requests:
-            nr = []
-            for r in self.requests:
-                if r.called:
-                    self._tmp_results.append(r.result)
-                else:
-                    nr.append(r)
-            self.requests = nr
-        if self.requests:
-            self.actor.ioloop.add_callback(self)
-        else:
-            self.callback(self._tmp_results)
-            
+def get_command(name):
+    '''Get the command function *name*'''
+    command = global_commands_table.get(name.lower())
+    if not command:
+        raise CommandNotFound(name)
+    return command
 
-class CallerCallBack(object):
-    __slots__ = ('rid','proxy','caller')
-    
-    def __init__(self, request, actor, caller):
-        self.rid = request.rid
-        self.proxy = actor.proxy
-        self.caller = caller
-        
-    def __call__(self, result):
-        self.proxy.callback(self.caller,self.rid,result)
-        
 
-class ActorRequest(Deferred):
-    REQUESTS = {}
-    
-    def __init__(self, actor, name, ack, msg):
-        super(ActorRequest,self).__init__(rid = gen_unique_id())
-        if hasattr(actor,'aid'):
-            actor = actor.aid
-        self.aid = actor
-        self.name = name
-        self.msg = msg
+class command:
+    '''Decorator for pulsar command functions.
+
+    :parameter ack: ``True`` if the command acknowledge the sender with a
+        response. Usually is set to ``True`` (which is also the default value).
+    '''
+    def __init__(self, ack=True):
         self.ack = ack
-        if self.ack:
-            self.REQUESTS[self.rid] = self
-        
-    def __str__(self):
-        return '{0} - {1}'.format(self.name,self.rid[:8])
-    
-    def __repr__(self):
-        return self.__str__()
-    
-    def __getstate__(self):
-        #Remove the list of callbacks
-        d = self.__dict__.copy()
-        d['_callbacks'] = []
-        return d
-    
-    def make_actor_callback(self, actor, caller):
-        return CallerCallBack(self,actor,caller)
-            
-    @classmethod
-    def actor_callback(cls, rid, result):
-        r = cls.REQUESTS.pop(rid,None)
-        if r:
-            r.callback(result)
-            
 
-class ActorProxyRequest(object):
-    __slots__ = ('caller','_func_name','ack')
-    
-    def __init__(self, caller, name, ack):
-        self.caller = caller
-        self._func_name = name
-        self.ack = ack
-        
-    def __repr__(self):
-        return '{0} calling "{1}"'.format(self.caller,self._func_name)
-        
-    def __call__(self, *args, **kwargs):
-        if len(args) == 0:
-            actor = self.caller
+    def __call__(self, f):
+        self.name = f.__name__.lower()
+
+        def command_function(request, args, kwargs):
+            return f(request, *args, **kwargs)
+
+        command_function.ack = self.ack
+        command_function.__name__ = self.name
+        command_function.__doc__ = f.__doc__
+        global_commands_table[self.name] = command_function
+        return command_function
+
+
+class ActorIdentity(object):
+
+    def identity(self):
+        return self.aid
+
+
+class ActorProxyDeferred(Deferred, ActorIdentity):
+    '''A :class:`Deferred` for an :class:`ActorProxy`.
+
+    The callback will be an :class:`ActorProxy` which will be received once
+    the remote :class:`Actor` is fully functional.
+
+    .. attribute:: aid
+
+        The the remote :attr:`Actor` id
+
+    '''
+    def __init__(self, aid, msg=None):
+        super(ActorProxyDeferred, self).__init__()
+        if isinstance(aid, ActorProxyMonitor):
+            aid.callback = self
+            self.aid = aid.aid
         else:
-            actor = args[0]
-            args = args[1:]
-        ser = self.serialize
-        args = tuple((ser(a) for a in args))
-        kwargs = dict((k,ser(a)) for k,a in iteritems(kwargs))
-        actor = get_proxy(actor)
-        return actor.send(self.caller.aid,(args,kwargs), name = self._func_name, ack = self.ack)
-    
-    def serialize(self, obj):
-        if hasattr(obj,'aid'):
-            return obj.aid
-        else:
-            return obj
+            self.aid = aid
+            # Listen for the callbacks and errorbacks
+            msg.add_both(self.callback)
+
+    def __repr__(self):
+        return '%s(%s)' % (self.__class__, self.aid)
+    __str__ = __repr__
 
 
-class ActorProxy(object):
-    '''A proxy for a :class:`pulsar.utils.async.RemoteMixin` instance.
-This is a light class which delegates function calls to a remote object.
+class ActorProxy(ActorIdentity):
+    '''A proxy for a remote :class:`Actor`.
 
-.. attribute: proxyid
+    This is a lightweight class which delegates function calls to the
+    underlying remote object.
 
-    Unique ID for the remote object
-    
-.. attribute: remotes
+    It is picklable and therefore can be send from actor to actor using
+    :ref:`actor message passing <tutorials-messages>`.
 
-    dictionary of remote functions names with value indicationg if the
-    remote function will acknowledge the call.
-'''     
+    For example, lets say we have a proxy ``a``, to send a message to it::
+
+        from pulsar import send
+
+        send(a, 'echo', 'hello there!')
+
+    will send the :ref:`command <actor_commands>` ``echo`` to actor ``a`` with
+    parameter ``"hello there!"``.
+
+    .. attribute:: aid
+
+        Unique ID for the remote :class:`Actor`
+
+    .. attribute:: address
+
+        the socket address of the underlying :attr:`Actor.mailbox`.
+
+    '''
     def __init__(self, impl):
         self.aid = impl.aid
-        self.remotes = impl.actor_functions
-        self.inbox = impl.inbox
-        self.timeout = impl.timeout
-        self.loglevel = impl.loglevel
-        
-    def send(self, aid, msg, name = None, ack = False):
-        '''\
-Send a message to the actor referenced by ``self``.
+        self.name = impl.name
+        self.cfg = impl.cfg
+        if hasattr(impl, 'address'):
+            self.address = impl.address
 
-:parameter aid: the actor id of the actor sending the message
-:parameter msg: the message body.
-:parameter name: the name of the message. If non name is provided, the message will be
-                 broadcasted by the receiving actor, otherwise a specific action
-                 will be performed. Default ``None``.
-:parameter ack: If ``True`` the receiving actor will send a callback.'''
-        name = name or DEFAULT_MESSAGE_CHANNEL
-        request = ActorRequest(aid,name,ack,msg)
-        try:
-            self.inbox.put(request)
-            return request
-        except Exception as e:
-            pass
-        
     def __repr__(self):
-        return self.aid[:8]
-    
-    def __str__(self):
-        return self.__repr__()
-    
-    def __eq__(self, o):
-        o = get_proxy(o,True)
-        return o and self.aid == o.aid
-    
-    def __ne__(self, o):
-        return not self.__eq__(o) 
-    
-    def __getstate__(self):
-        '''Because of the __getattr__ implementation,
-we need to manually implement the pcikling and unpickling of thes object.'''
-        return (self.aid,self.remotes,self.inbox,self.timeout,self.loglevel)
-    
-    def __setstate__(self, state):
-        self.aid,self.remotes,self.inbox,self.timeout,self.loglevel = state
-        
-    def __getattr__(self, name):
-        if name in self.remotes:
-            ack = self.remotes[name]
-            return ActorProxyRequest(self, name, ack)
-        else:
-            raise AttributeError("'{0}' object has no attribute '{1}'".format(self,name))
+        return '%s(%s)' % (self.name, self.aid)
+    __str__ = __repr__
 
-    def local_info(self):
-        return {'aid':self.aid[:8],
-                'timeout':self.timeout,
-                'inbox_size':self.inbox.qsize()}
+    @property
+    def proxy(self):
+        return self
+
+    def __eq__(self, o):
+        o = get_proxy(o, True)
+        return o and self.aid == o.aid
+
+    def __ne__(self, o):
+        return not self.__eq__(o)
 
 
 class ActorProxyMonitor(ActorProxy):
-    
+    '''A specialised :class:`ActorProxy` class.
+
+    It contains additional information about the remote underlying
+    :class:`pulsar.Actor`. Instances of this class serialise into
+    :class:`ActorProxy`.
+
+    The :class:`ActorProxyMonitor` is special since it lives in the
+    :class:`Arbiter` domain and it is used by the :class:`Arbiter`
+    (or a :class:`Monitor`) to monitor the state of the spawned actor.
+
+    .. attribute:: impl
+
+        The :class:`Concurrency` instance for the remote :class:`Actor`. This
+        dictionary is constantly updated by the remote actor by sending the
+        :ref:`info message <actor_info_command>`.
+
+    .. attribute:: info
+
+        Dictionary of information regarding the remote :class:`Actor`
+
+    .. attribute:: mailbox
+
+        This is the connection with the remote actor. It is available once the
+        :ref:`actor handshake <handshake>` between the actor and the monitor
+        has completed. The :attr:`mailbox` is a server-side
+        :class:`pulsar.async.mailbox.MailboxConsumer` instance and it is used
+        by the :func:`send` function to send messages to the remote actor.
+    '''
+    monitor = None
+
     def __init__(self, impl):
         self.impl = impl
-        self.notified = time()
-        self.stopping = 0
-        super(ActorProxyMonitor,self).__init__(impl)
-        
+        self.info = {}
+        self.mailbox = None
+        self.callback = None
+        self.spawning_start = None
+        self.stopping_start = None
+        super(ActorProxyMonitor, self).__init__(impl)
+
+    @property
+    def notified(self):
+        '''Last time this :class:`ActorProxyMonitor` was notified by the
+        remote actor.'''
+        return self.info.get('last_notified')
+
     @property
     def pid(self):
         return self.impl.pid
-    
+
+    @property
+    def proxy(self):
+        '''The :class:`ActorProxy` for this monitor.'''
+        return ActorProxy(self)
+
+    def __reduce__(self):
+        return self.proxy.__reduce__()
+
     def is_alive(self):
+        '''``True`` if underlying actor is alive.
+        '''
         return self.impl.is_alive()
-        
+
     def terminate(self):
+        '''Terminate life of underlying actor.
+        '''
         self.impl.terminate()
-            
-    def __str__(self):
-        return self.impl.__str__()
-    
-    def local_info(self):
-        data = super(ActorProxyMonitor,self).local_info()
-        data.update({'notified':self.notified,
-                     'pid':self.pid})
-        return data
+
+    def join(self, timeout=None):
+        '''Wait until the underlying actor terminates.
+
+        If ``timeout`` is provided, it raises an exception if the timeout
+        is reached.
+        '''
+        self.impl.join(timeout=timeout)
+
+    def start(self):
+        '''Start the remote actor.
+        '''
+        self.spawning_start = default_timer()
+        self.impl.start()
+
+    def should_be_alive(self):
+        if not self.mailbox:
+            return default_timer() - self.spawning_start > ACTOR_ACTION_TIMEOUT
+        else:
+            return True
+
+    def should_terminate(self):
+        if self.stopping_start is None:
+            self.stopping_start = default_timer()
+            return False
+        else:
+            dt = default_timer() - self.stopping_start
+            return dt if dt >= ACTOR_ACTION_TIMEOUT else False

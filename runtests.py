@@ -1,50 +1,73 @@
 #!/usr/bin/env python
-import os
 import sys
-from pulsar.apps.test import TestSuiteRunner
+import os
+from multiprocessing import current_process
+
+try:
+    import pep8
+except ImportError:
+    pep8 = None
 
 
-class TestExtractor(object):
-    TESTMAPPING = {'regression':'tests','bench':'bench','profile':'profile'}
-    def __init__(self, path):
-        self.path = path
-        
-    def testdir(self, testtype):
-        return os.path.join(self.path,testtype)
-    
-    def test_module(self, testtype, loc, app):
-        return '{0}.{1}.tests'.format(loc,app)
-        
-        
-class ExampleExtractor(TestExtractor):
-    
-    def testdir(self, testtype):
-        return self.path
-    
-    def test_module(self, testtype, loc, app):
-        name = self.TESTMAPPING[testtype]
-        return '{0}.{1}.{2}'.format(loc,app,name)
+def run(**params):
+    args = params.get('argv', sys.argv)
+    if '--pep8' in args:
+        args.remove('--pep8')
+        if pep8:
+            print('Running pep8.')
+            pep8style = pep8.StyleGuide(paths=['pulsar', 'examples'],
+                                        config_file='setup.cfg')
+            options = pep8style.options
+            report = pep8style.check_files()
+            if options.statistics:
+                report.print_statistics()
+            if options.benchmark:
+                report.print_benchmark()
+            if options.testsuite and not options.quiet:
+                report.print_results()
+            if report.total_errors:
+                if options.count:
+                    sys.stderr.write(str(report.total_errors) + '\n')
+                sys.exit(1)
+            print('OK')
+            sys.exit(0)
+        else:
+            print('pep8 must be installed')
+            sys.exit(1)
+    if '--coverage' in args or params.get('coverage'):
+        import coverage
+        p = current_process()
+        p._coverage = coverage.coverage(data_suffix=True)
+        p._coverage.start()
+    runtests(**params)
 
-    
-def run():
-    '''To perform preprocessing before tests add a cfg.py module'''
-    dirs = (('examples',ExampleExtractor),
-            ('tests',TestExtractor))
-    try:
-        import cfg
-    except ImportError:
-        pass
-    p = lambda x : os.path.split(x)[0]
-    path = p(os.path.abspath(__file__))
-    
-    running_tests = []
-    for t,c in dirs:
-        p = os.path.join(path,t)
-        if p not in sys.path:
-            sys.path.insert(0, p)
-        running_tests.append(c(p))
-        
-    TestSuiteRunner(running_tests).start()
+
+def runtests(cov=None, **params):
+    import pulsar
+    from pulsar.utils.path import Path
+    from pulsar.apps.test import TestSuite
+    from pulsar.apps.test.plugins import bench, profile
+    import pulsar.utils.settings.backend
+    #
+    path = Path(__file__)
+    path.add2python('stdnet', 1, down=['python-stdnet'], must_exist=False)
+    strip_dirs = [Path(pulsar.__file__).parent.parent, os.getcwd()]
+    #
+    suite = TestSuite(description='Pulsar Asynchronous test suite',
+                      modules=('tests',
+                               ('examples', 'tests'),
+                               ('examples', 'test_*')),
+                      plugins=(bench.BenchMark(),
+                               profile.Profile()),
+                      pidfile='test.pid',
+                      **params).start()
+    #
+    if suite.cfg.coveralls:
+        from pulsar.utils.cov import coveralls
+        coveralls(strip_dirs=strip_dirs,
+                  stream=suite.stream,
+                  repo_token='CNw6W9flYDDXZYeStmR1FX9F4vo0MKnyX')
+
 
 if __name__ == '__main__':
     run()
