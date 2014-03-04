@@ -1,13 +1,15 @@
 '''\
-Pulsar Python Shell
+Pulsar Python Shell example::
+
+    python pshell.py
 '''
-import os
 try:
-    from penv import pulsar
-except ImportError:
-    import pulsar
+    from pulsar.apps.shell import PulsarShell
+except ImportError:  # pragma nocover
+    import sys
+    sys.path.append('../../')
+    from pulsar.apps.shell import PulsarShell
 
-from pulsar.apps.shell import PulsarShell 
 
-if __name__ == '__main__':
-    PulsarShell(concurrency = 'thread').start()
+if __name__ == '__main__':  # pragma nocover
+    PulsarShell().start()

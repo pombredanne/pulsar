@@ -1,20 +1,23 @@
+#!/usr/bin/env python
 import os
 import sys
+from setuptools import setup
+from distutils.command.install_data import install_data
+from distutils.command.install import INSTALL_SCHEMES
 
-PACKAGE_NAME  = 'pulsar'
-root_dir      = os.path.split(os.path.abspath(__file__))[0]
-package_dir   = os.path.join(root_dir, PACKAGE_NAME)
+os.environ['pulsar_setup_running'] = 'yes'
+
+package_name = 'pulsar'
+package_fullname = package_name
+root_dir = os.path.split(os.path.abspath(__file__))[0]
+package_dir = os.path.join(root_dir, package_name)
 
 # Try to import lib build
 try:
-    from lib.setup import libparams
+    from extensions.setup import libparams, BuildFailed
 except ImportError:
-    libparams = {'cmdclass': {}}
-    
-    
-from distutils.core import setup
-from distutils.command.install_data import install_data
-from distutils.command.install import INSTALL_SCHEMES
+    libparams = None
+
 
 class osx_install_data(install_data):
 
@@ -22,15 +25,16 @@ class osx_install_data(install_data):
         self.set_undefined_options('install', ('install_lib', 'install_dir'))
         install_data.finalize_options(self)
 
-libparams['cmdclass']['install_data'] = osx_install_data if sys.platform == "darwin" else install_data
 
 for scheme in INSTALL_SCHEMES.values():
     scheme['data'] = scheme['purelib']
 
+
 def get_module():
     if root_dir not in sys.path:
-        sys.path.insert(0,root_dir)
-    return __import__(PACKAGE_NAME)
+        sys.path.insert(0, root_dir)
+    return __import__(package_name)
+
 
 mod = get_module()
 
@@ -53,15 +57,16 @@ def fullsplit(path, result=None):
         return result
     return fullsplit(head, [tail] + result)
 
+
 # Compile the list of packages available, because distutils doesn't have
 # an easy way to do this.
-def get_rel_dir(d,base,res=''):
+def get_rel_dir(d, base, res=''):
     if d == base:
         return res
-    br,r = os.path.split(d)
+    br, r = os.path.split(d)
     if res:
-        r = os.path.join(r,res)
-    return get_rel_dir(br,base,r)
+        r = os.path.join(r, res)
+    return get_rel_dir(br, base, r)
 
 
 packages, data_files = [], []
@@ -71,34 +76,73 @@ if pieces[-1] == '':
 else:
     len_root_dir = len(pieces)
 
-for dirpath, dirnames, filenames in os.walk(package_dir):
-    # Ignore dirnames that start with '.'
-    for i, dirname in enumerate(dirnames):
-        if dirname.startswith('.'): del dirnames[i]
+for dirpath, _, filenames in os.walk(package_dir):
     if '__init__.py' in filenames:
         packages.append('.'.join(fullsplit(dirpath)[len_root_dir:]))
-    elif filenames:
-        rel_dir = get_rel_dir(dirpath,root_dir)
-        data_files.append([rel_dir, [os.path.join(dirpath, f) for f in filenames]])
+    elif filenames and not dirpath.endswith('__pycache__'):
+        rel_dir = get_rel_dir(dirpath, package_dir)
+        data_files.extend((os.path.join(rel_dir, f) for f in filenames))
 
 if len(sys.argv) > 1 and sys.argv[1] == 'bdist_wininst':
     for file_info in data_files:
         file_info[0] = '\\PURELIB\\%s' % file_info[0]
 
 
-libparams.update({
-                'name'         : PACKAGE_NAME,
-                'version'      : mod.__version__,
-                'author'       : mod.__author__,
-                'author_email' : mod.__contact__,
-                'url'          : mod.__homepage__,
-                'license'      : mod.__license__,
-                'description'  : mod.__doc__,
-                'long_description' : read('README.rst'),
-                'packages'     : packages,
-                'data_files'   : data_files,
-                'classifiers' : mod.CLASSIFIERS
-                })
- 
-setup(**libparams)
+def run_setup(params=None):
+    if not params:
+        params = {'cmdclass': {}}
+    if sys.platform == "darwin":
+        params['cmdclass']['install_data'] = osx_install_data
+    else:
+        params['cmdclass']['install_data'] = install_data
+    argv = sys.argv
+    if len(argv) > 1 and argv[1] != 'sdist' and sys.version_info >= (3, 0):
+        try:
+            packages.remove('pulsar.utils.fallbacks.py2')
+        except ValueError:
+            pass
+    params.update({'name': package_fullname,
+                   'version': mod.__version__,
+                   'author': mod.__author__,
+                   'author_email': mod.__contact__,
+                   'url': mod.__homepage__,
+                   'license': mod.__license__,
+                   'description': mod.__doc__,
+                   'long_description': read('README.rst'),
+                   'packages': packages,
+                   'package_data': {package_name: data_files},
+                   'classifiers':  mod.CLASSIFIERS})
+    setup(**params)
 
+
+def status_msgs(*msgs):
+    print('*' * 75)
+    for msg in msgs:
+        print(msg)
+    print('*' * 75)
+
+
+def run(argv=None):
+    if argv:
+        sys.argv = list(argv)
+    if libparams is None:
+        status_msgs('WARNING: C extensions could not be compiled, '
+                    'Maybe Cython is not installed.')
+        run_setup()
+        status_msgs("Plain-Python build succeeded.")
+    else:
+        try:
+            run_setup(libparams)
+        except BuildFailed as exc:
+            status_msgs(
+                exc.msg,
+                "WARNING: C extensions could not be compiled, "
+                "speedups are not enabled.",
+                "Failure information, if any, is above.",
+                "Retrying the build without C extensions now.")
+            run_setup()
+            status_msgs("Plain-Python build succeeded.")
+
+
+if __name__ == '__main__':
+    run()

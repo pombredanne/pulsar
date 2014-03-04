@@ -1,79 +1,66 @@
-from pulsar import test, SERVER_SOFTWARE, Queue, Empty
-from pulsar.http import HttpClient
+'''Tests the "helloworld" example.'''
+import unittest
+
+from pulsar import send, SERVER_SOFTWARE, get_application, get_actor
+from pulsar.apps.http import HttpClient
+from pulsar.apps.test import run_on_arbiter, dont_run_with_thread
 
 from .manage import server
 
 
-class PostRequest(object):
+class TestHelloWorldThread(unittest.TestCase):
+    app_cfg = None
+    concurrency = 'thread'
 
-    def __init__(self):
-        self.q = Queue()
-        
-    def __call__(self, worker, request):
-        self.q.put((worker.aid,worker.age,worker.nr))
-        
-    def get(self):
-        try:
-            return self.q.get(timeout = 0.5)
-        except Empty:
-            return None
-        
+    @classmethod
+    def name(cls):
+        return 'helloworld_' + cls.concurrency
 
-class TestHelloWorldExample(test.TestCase):
-    
-    def initTests(self):
-        r = PostRequest()
-        s = server(concurrency = 'process',
-                   bind = '127.0.0.1:0',
-                   parse_console = False,
-                   name = 'helloworld',
-                   post_request=r)
-        self.__class__._server = s
-        self.__class__._rm = r
-        monitor = self.arbiter.get_monitor(s.mid)
-        self.wait(lambda : not monitor.is_alive())
-        self.__class__.uri = 'http://{0}:{1}'.format(*monitor.address)
-        
-    def endTests(self):
-        monitor = self.arbiter.get_monitor(self._server.mid)
-        monitor.stop()
-        self.wait(lambda : monitor.aid in self.arbiter.monitors)
-        self.assertFalse(monitor.is_alive())
-        self.assertTrue(monitor.closed())
-    
-    def setUp(self):
-        self.c = HttpClient()
-        
+    @classmethod
+    def setUpClass(cls):
+        s = server(name=cls.name(), concurrency=cls.concurrency,
+                   bind='127.0.0.1:0')
+        cls.app_cfg = yield send('arbiter', 'run', s)
+        cls.uri = 'http://{0}:{1}'.format(*cls.app_cfg.addresses[0])
+        cls.client = HttpClient()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.app_cfg is not None:
+            yield send('arbiter', 'kill_actor', cls.app_cfg.name)
+
+    @run_on_arbiter
     def testMeta(self):
-        s = self._server
-        self.assertEqual(s.name,'helloworld')
-        monitor = self.arbiter.get_monitor(s.mid)
-        self.assertEqual(monitor.name,'helloworld')
-        
-    def testMonitors(self):
-        s = self._server
-        self.assertTrue(len(self.arbiter.monitors)>=2)
-        monitor = self.arbiter.get_monitor(s.mid)
-        self.assertTrue(monitor.name in self.arbiter.monitors)
-        self.assertTrue(monitor.is_alive())
-        
+        app = yield get_application(self.name())
+        self.assertEqual(app.name, self.name())
+        monitor = get_actor().get_actor(app.name)
+        self.assertTrue(monitor.is_running())
+        self.assertEqual(app, monitor.app)
+        self.assertEqual(str(app), app.name)
+        self.assertEqual(app.cfg.bind, '127.0.0.1:0')
+
     def testResponse(self):
-        c = self.c
-        r = self._rm
-        resp = self.c.request(self.uri)
-        self.assertTrue(resp.status,200)
-        content = resp.content
-        self.assertEqual(content,b'Hello World!\n')
-        headers = resp.response.headers
+        c = self.client
+        response = yield c.get(self.uri)
+        self.assertEqual(response.status_code, 200)
+        content = response.get_content()
+        self.assertEqual(content, b'Hello World!\n')
+        headers = response.headers
         self.assertTrue(headers)
-        self.assertEqual(headers['content-type'],'text/plain')
-        self.assertEqual(headers['server'],SERVER_SOFTWARE)
-        #
-        # lets check the response count
-        aid,age,nr = r.get()
-        self.assertTrue(nr)
-        resp = self.c.request(self.uri)
-        aid1,age1,nr1 = r.get()
-        if aid == aid1:
-            self.assertEqual(nr1,nr+1)
-        
+        self.assertEqual(headers['content-type'], 'text/plain')
+        self.assertEqual(headers['server'], SERVER_SOFTWARE)
+
+    def testTimeIt(self):
+        c = self.client
+        response = c.timeit(5, c.get, self.uri)
+        #cc = list(c.connection_pools.values())[0]._concurrent_connections
+        #self.assertTrue(cc)
+        yield response
+        self.assertTrue(response.locked_time >= 0)
+        self.assertTrue(response.total_time >= response.locked_time)
+        self.assertEqual(response.num_failures, 0)
+
+
+@dont_run_with_thread
+class TestHelloWorldProcess(TestHelloWorldThread):
+    concurrency = 'process'

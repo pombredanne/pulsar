@@ -2,15 +2,21 @@
 Security related helpers such as secure password hashing tools.
 """
 from hashlib import sha1
+from uuid import uuid4
 import string
-from random import SystemRandom
+from random import SystemRandom, choice
 
-from .py2py3 import range
+from .pep import range
+from .httpurl import ascii_letters
 
-SALT_CHARS = string.letters + string.digits
+SALT_CHARS = ascii_letters + string.digits
 
 
 _sys_rng = SystemRandom()
+
+
+def gen_unique_id():
+    return str(uuid4())
 
 
 def gen_salt(length):
@@ -21,7 +27,7 @@ def gen_salt(length):
 
 
 def _hash_internal(salt, password):
-    return sha1('{0}{1}'.format(salt,password).encode('utf-8')).hexdigest()
+    return sha1(('%s%s' % (salt, password)).encode('utf-8')).hexdigest()
 
 
 def generate_password_hash(password, salt_length=8):
@@ -35,3 +41,9 @@ def check_password_hash(pwhash, password):
         return False
     salt, hashval = pwhash.split('$')
     return _hash_internal(salt, password) == hashval
+
+
+def random_string(characters=None, length=None):
+    length = length or 20
+    characters = characters or SALT_CHARS
+    return ''.join((choice(characters) for s in range(length)))

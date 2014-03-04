@@ -1,156 +1,390 @@
+'''
+Module containing utilities and mixins for logging and serialisation.
+'''
 import sys
+from copy import deepcopy, copy
+from time import time
 import logging
+from threading import Lock
+from functools import wraps
+from multiprocessing import current_process
 
-from .system import platform
+from .pep import force_native_str
 
-SERVER_NAME = 'Pulsar'
+win32 = sys.platform == "win32"
 
+if sys.version_info < (2, 7):    # pragma    nocover
+    from .fallbacks._dictconfig import dictConfig
 
-__all__ = ['SERVER_NAME',
-           'getLogger',
-           'LogginMixin',
-           'PickableMixin',
-           'Silence',
-           'LogSelf',
-           'logerror']
+    class NullHandler(logging.Handler):
+        def emit(self, record):
+            pass
+else:
+    from logging.config import dictConfig
+    from logging import NullHandler
 
+from .structures import AttributeDictionary
+
+NOLOG = 100
 
 LOG_LEVELS = {
-        "critical": logging.CRITICAL,
-        "error": logging.ERROR,
-        "warning": logging.WARNING,
-        "info": logging.INFO,
-        "debug": logging.DEBUG
-    }
+    "critical": logging.CRITICAL,
+    "error": logging.ERROR,
+    "warning": logging.WARNING,
+    "info": logging.INFO,
+    "debug": logging.DEBUG,
+    'none': None
+}
 
 
-def getLogger(name = None):
-    '''Get logger name in "Pulsar" namespace'''
-    name = '{0}.{1}'.format(SERVER_NAME,name) if name else SERVER_NAME
-    return logging.getLogger(name)
+LOGGING_CONFIG = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': ('%(asctime)s [p=%(process)s, t=%(thread)s,'
+                       ' %(levelname)s, %(name)s] %(message)s'),
+            'datefmt': '%H:%M:%S'
+        },
+        'very_verbose': {
+            'format': '%(asctime)s [p=%(process)s,t=%(thread)s]'
+                      ' [%(levelname)s] [%(name)s] %(message)s',
+            'datefmt': '%Y-%m-%d %H:%M:%S'
+        },
+        'simple': {
+            'format': '%(asctime)s %(levelname)s %(message)s',
+            'datefmt': '%Y-%m-%d %H:%M:%S'
+        },
+        'message': {'format': '%(message)s'}
+    },
+    'handlers': {
+        'silent': {
+            'class': 'pulsar.utils.log.Silence',
+        },
+        'console': {
+            'level': 'DEBUG',
+            'class': 'pulsar.utils.log.ColoredStream',
+            'formatter': 'verbose'
+        },
+        'console_message': {
+            'class': 'pulsar.utils.log.ColoredStream',
+            'formatter': 'message'
+        }
+    },
+    'filters ': {},
+    'loggers': {},
+    'root': {}
+}
 
 
-def logerror(func):
-    
-    def _(self,*args,**kwargs):
-        try:
-            return func(self,*args,**kwargs)
-        except Exception as e:
-            if self.log:
-                self.log.critical('"{0}" had an unhandled exception in function "{1}": {2}'\
-                                  .format(self,func.__name__,e),exc_info=sys.exc_info())
-            pass
-        
+def update_config(config, c):
+    for name in ('handlers', 'formatters', 'filters', 'loggers', 'root'):
+        if name in c:
+            config[name].update(c[name])
+
+
+def local_method(f):
+    '''Decorator to be used in conjunction with :class:`LocalMixin` methods.
+    '''
+    name = f.__name__
+
+    def _(self, *args):
+        local = self.local
+        if name not in local:
+            setattr(local, name, f(self, *args))
+        return getattr(local, name)
     return _
 
 
-class LogSelf(object):
-    '''\
-    Wrapper for logging with the message starting with the
-string representation of an instance.
-
-:parameter instance: instance which prefix the message.
-:parameter logger: the logger object.
+def local_property(f):
+    '''Decorator to be used in conjunction with :class:`LocalMixin` methods.
     '''
-    LOGGING_FUNCTIONS = ('debug','info','error','warning','critical','exception')
-    
-    def __init__(self,instance,logger):
-        self.instance = instance
-        self.logger = logger
-        for func in self.LOGGING_FUNCTIONS:
-            setattr(self,func,self._handle(func))
-    
-    def _msg(self, msg):
-        return '{0} - {1}'.format(self.instance,msg)
-    
-    def _handle(self, name):
-        func = getattr(self.logger,name)
-        def _(msg, *args, **kwargs):
-            func(self._msg(msg),*args,**kwargs)
-        _.__name__ = name
-        return _
+    name = f.__name__
+
+    def _(self):
+        local = self.local
+        if name not in local:
+            setattr(local, name, f(self))
+        return getattr(local, name)
+
+    return property(_, doc=f.__doc__)
+
+
+def lazy_string(f):
+    def _(*args, **kwargs):
+        return LazyString(f, *args, **kwargs)
+    return _
+
+
+class LazyString:
+    __slots__ = ('value', 'f', 'args', 'kwargs')
+
+    def __init__(self, f, *args, **kwargs):
+        self.value = None
+        self.f = f
+        self.args = args
+        self.kwargs = kwargs
+
+    def __str__(self):
+        if self.value is None:
+            self.value = force_native_str(self.f(*self.args, **self.kwargs))
+        return self.value
+    __repr__ = __str__
+
+
+class WritelnDecorator(object):
+    """Used to decorate file-like objects with a handy 'writeln' method.
+    taken from python.
+    """
+    def __init__(self, stream):
+        self.stream = stream
+
+    def __getattr__(self, attr):
+        if attr in ('stream', '__getstate__'):
+            raise AttributeError(attr)
+        return getattr(self.stream, attr)
+
+    def writeln(self, arg=None):
+        if arg:
+            self.write(arg)
+        self.write('\n')  # text-mode streams translate to \r\n if needed
+
+
+class LocalMixin(object):
+    '''Defines the :attr:`local` attribute.
+
+    Classes derived from a :class:`LocalMixin` can use the
+    :func:`local_method` and :func:`local_property` decorators for managing
+    attributes which are not picklable.
+    '''
+    @property
+    def local(self):
+        '''A lazy :class:`pulsar.utils.structures.AttributeDictionary`.
+
+        This attribute is removed when pickling an instance.
+        '''
+        if not hasattr(self, '_local'):
+            self._local = AttributeDictionary()
+        return self._local
+
+    @local_property
+    def lock(self):
+        '''A local threading.Lock.'''
+        return Lock()
+
+    @local_property
+    def process_lock(self):
+        return process_global('lock')
+
+    def clear_local(self):
+        self.__dict__.pop('_local', None)
+
+    def __getstate__(self):
+        '''Remove the local dictionary.'''
+        d = self.__dict__.copy()
+        d.pop('_local', None)
+        return d
+
+
+def lazymethod(f):
+    name = '_lazy_%s' % f.__name__
+
+    @wraps(f)
+    def _(self):
+        if not hasattr(self, name):
+            setattr(self, name, f(self))
+        return getattr(self, name)
+
+    return _
+
+
+def lazyproperty(f):
+    return property(lazymethod(f), doc=f.__doc__)
+
+
+def process_global(name, val=None, setval=False):
+    '''Access and set global variables for the current process.'''
+    p = current_process()
+    if not hasattr(p, '_pulsar_globals'):
+        p._pulsar_globals = {'lock': Lock()}
+    if setval:
+        p._pulsar_globals[name] = val
+    else:
+        return p._pulsar_globals.get(name)
 
 
 class Silence(logging.Handler):
     def emit(self, record):
         pass
-    
 
-class LogginMixin(object):
-    loglevel = None
-    default_logging_level = None
-    _class_code = None
-        
-    def getLogger(self, **kwargs):
-        if hasattr(self,'log'):
-            return self.log
+
+def configured_logger(logger, config=None, level=None, handlers=None):
+    '''Configured logger.
+    '''
+    with process_global('lock'):
+        logconfig = original = process_global('_config_logging')
+        # if the logger was not configured, do so.
+        if not logconfig:
+            logconfig = deepcopy(LOGGING_CONFIG)
+            if config:
+                update_config(logconfig, config)
+            original = logconfig
+            process_global('_config_logging', logconfig, True)
         else:
-            logger = kwargs.pop('logger',None)
-            return logger or getLogger(self.class_code)
-    
-    def __repr__(self):
-        return self.class_code
-    
-    def __str__(self):
-        return self.__repr__()
-    
-    @property
-    def class_code(self):
-        return self.__class__.code()
-    
-    @classmethod
-    def code(cls):
-        return cls._class_code or cls.__name__
-    
-    def configure_logging(self, handlers = None):
-        '''Configure logging'''
-        loglevel = self.loglevel
+            logconfig = deepcopy(logconfig)
+            logconfig['disable_existing_loggers'] = False
+            logconfig.pop('loggers', None)
+            logconfig.pop('root', None)
+
+        if level is None:
+            level = logging.NOTSET
+        else:
+            try:
+                level = int(level)
+            except (ValueError):
+                lv = str(level).upper()
+                if lv in logging._levelNames:
+                    level = logging._levelNames[lv]
+                else:
+                    level = logging.NOTSET
+        # No loggers configured. This means no logconfig setting
+        # parameter was used. Set up the root logger with default
+        # loggers
+        if level == logging.NOTSET:
+            handlers = ['silent']
+        else:
+            handlers = handlers or ['console']
+        level = logging.getLevelName(level)
+        if logger not in original['loggers']:
+            if 'loggers' not in logconfig:
+                logconfig['loggers'] = {}
+            l = {'level': level, 'handlers': handlers, 'propagate': False}
+            original['loggers'][logger] = l
+            logconfig['loggers'][logger] = l
+        if not original.get('root'):
+            logconfig['root'] = {'handlers': handlers,
+                                 'level': level}
+        if logconfig:
+            dictConfig(logconfig)
+        return logging.getLogger(logger)
+
+
+WHITE = 37
+COLOURS = {'red': 31,
+           'green': 32,
+           'yellow': 33,
+           'blue': 34,
+           'magenta': 35,
+           'cyan': 36,
+           'white': WHITE}
+
+
+class ColoredStream(logging.StreamHandler):   # pragma    nocover
+    bold = True
+    terminator = '\n'
+    COLORS = {"DEBUG": "cyan",
+              "WARNING": "magenta",
+              "ERROR": "red",
+              "CRITICAL": "red",
+              "INFO": "green"}
+
+    def __init__(self, stream=None):
+        if not stream:
+            stream = sys.stdout
+        logging.StreamHandler.__init__(self, stream)
+
+    def emit(self, record):
         try:
-            self.loglevel = int(loglevel)
-        except (TypeError,ValueError):
-            lv = str(loglevel).lower()
-            self.loglevel = LOG_LEVELS.get(lv,self.default_logging_level)
-        logger = logging.getLogger()
-        color = False
-        if not handlers:
-            handlers = []
-            if self.loglevel is None:
-                handlers.append(Silence())
-            else:
-                color = True
-                handlers.append(logging.StreamHandler())
-        f = self.logging_formatter(color)
-        for h in handlers:
-            h.setFormatter(f)
-            logger.addHandler(h)
-            if self.loglevel is not None:
-                logger.setLevel(self.loglevel)
+            self.color(record)
+            self.flush()
+        except (KeyboardInterrupt, SystemExit):  # pragma: no cover
+            raise
+        except:
+            self.handleError(record)
 
-    def logging_formatter(self, color = False):
-        format = '%(asctime)s [p=%(process)s,t=%(thread)s] [%(levelname)s] [%(name)s] %(message)s'
-        #format = r"%(asctime)s [%(process)d] [%(levelname)s] %(message)s"
-        datefmt = r"%Y-%m-%d %H:%M:%S"
-        if color and not platform.isWindows():
-            from pulsar.utils.tools import ColorFormatter as Formatter
+    def color(self, record):
+        text = self.format(record)
+        file = self.stream
+        if file.isatty() or True:
+            colour = self.COLORS.get(record.levelname)
+            code = COLOURS.get(colour, WHITE)
+            if win32:
+                handle = GetStdHandle(-11)
+                oldcolors = GetConsoleInfo(handle).wAttributes
+                code |= (oldcolors & 0x00F0)
+                if self.bold:
+                    code |= FOREGROUND_INTENSITY
+                SetConsoleTextAttribute(handle, code)
+                while len(text) > 32768:
+                    file.write(text[:32768])
+                    text = text[32768:]
+                if text:
+                    file.write(text)
+                file.write(self.terminator)
+                self.flush()
+                SetConsoleTextAttribute(handle, oldcolors)
+            else:
+                text = '\x1b[%sm%s\x1b[0m' % (code, text)
+                file.write(text)
+                file.write(self.terminator)
+                self.flush()
         else:
-            Formatter = logging.Formatter
-        return Formatter(format, datefmt)
-    
-    
-class PickableMixin(LogginMixin):
-    '''A Mixin used throught the library. It provides built in logging object and
-utilities for pickle.'''
-    REMOVABLE_ATTRIBUTES = ()
-     
-    def __getstate__(self):
-        d = self.__dict__.copy()
-        d.pop('log',None)
-        for attr in self.REMOVABLE_ATTRIBUTES:
-            d.pop(attr,None)
-        return d
-    
-    def __setstate__(self, state):
-        self.__dict__ = state
-        self.log = getLogger(self.class_code) 
-        self.configure_logging()
-        
+            file.write(text)
+            file.write(self.terminator)
+            self.flush()
+
+
+if win32:   # pragma    nocover
+    import ctypes
+    from ctypes import wintypes
+
+    SHORT = ctypes.c_short
+
+    class COORD(ctypes.Structure):
+        _fields_ = [('X', SHORT),
+                    ('Y', SHORT)]
+
+    class SMALL_RECT(ctypes.Structure):
+        _fields_ = [('Left', SHORT),
+                    ('Top', SHORT),
+                    ('Right', SHORT),
+                    ('Bottom', SHORT)]
+
+    class CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+        _fields_ = [('dwSize', COORD),
+                    ('dwCursorPosition', COORD),
+                    ('wAttributes', wintypes.WORD),
+                    ('srWindow', SMALL_RECT),
+                    ('dwMaximumWindowSize', COORD)]
+
+    WHITE = 0x0007
+    FOREGROUND_INTENSITY = 0x0008
+    COLOURS = {'red': 0x0004,
+               'green': 0x0002,
+               'yellow': 0x0006,
+               'blue': 0x0001,
+               'magenta': 0x0005,
+               'cyan': 0x0003,
+               'white': WHITE}
+
+    _GetStdHandle = ctypes.windll.kernel32.GetStdHandle
+    _GetStdHandle.argtypes = [wintypes.DWORD]
+    _GetStdHandle.restype = wintypes.HANDLE
+
+    def GetStdHandle(kind):
+        return _GetStdHandle(kind)
+
+    SetConsoleTextAttribute = ctypes.windll.kernel32.SetConsoleTextAttribute
+    SetConsoleTextAttribute.argtypes = [wintypes.HANDLE, wintypes.WORD]
+    SetConsoleTextAttribute.restype = wintypes.BOOL
+
+    _GetConsoleScreenBufferInfo = \
+        ctypes.windll.kernel32.GetConsoleScreenBufferInfo
+    _GetConsoleScreenBufferInfo.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(CONSOLE_SCREEN_BUFFER_INFO)]
+    _GetConsoleScreenBufferInfo.restype = wintypes.BOOL
+
+    def GetConsoleInfo(handle):
+        info = CONSOLE_SCREEN_BUFFER_INFO()
+        _GetConsoleScreenBufferInfo(handle, info)
+        return info

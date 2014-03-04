@@ -1,7 +1,12 @@
 include .gitignore
+include MANIFEST.in
 include LICENSE
 include README.rst
-recursive-include tests *
-recursive-include lib *
-recursive-include docs *
+include docs/make.bat
+include docs/Makefile
 recursive-include examples *
+recursive-include pulsar/apps/test/plugins/htmlfiles *
+recursive-include docs/source *
+recursive-include extensions *.py *.pxd *.pyx *.h
+include extensions/lua/src/*.c
+include extensions/lua/ext/*.c

@@ -1,0 +1,7 @@
+coverage
+http-parser
+cython
+django
+pep8
+setproctitle
+psutil
